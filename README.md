@@ -22,6 +22,9 @@ python3 app.py
 - `POST /api/assets`：登记资源
 - `POST /api/areas`：创建搜索区域
 - `POST /api/assignments`：按能力、海况和航程分配资源
+- `POST /api/relays/reserve`：为已分配区域校验并预留学生接替船（两段式交接，确认前原船继续担责）
+- `POST /api/relays/confirm`：确认接替，原船释放、接替船担责并记录切换时刻
+- `POST /api/relays/fail`：接替失败，预留退回原船并保留失败原因（服务重启也会自动回收未确认预留）
 - `POST /api/clues`、`POST /api/clues/verify`
 - `POST /api/assets/withdraw`：撤回资源并释放任务
 - `POST /api/incidents/transfer`、`POST /api/incidents/close`

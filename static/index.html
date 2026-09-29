@@ -1,8 +1,31 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
-<h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}.reserved{background:#fff3cd;color:#7a5b00}.switched{background:#d4edda;color:#155c2b}.failed{background:#f8d7da;color:#7a1c24}</style>
+<h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。区域接替流程：先 <code>/api/relays/reserve</code> 预留接替船（原船继续担责），再 <code>/api/relays/confirm</code> 确认切换；接替失败用 <code>/api/relays/fail</code> 退回原船。</div>
 <h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
 <h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
-<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
+<h2>搜索区域与接替</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>区域状态</th><th>优先级</th><th>原船</th><th>接替船</th><th>切换时刻</th><th>当前责任人</th><th>交接状态/原因</th></tr></thead><tbody></tbody></table>
+<h2>接替交接记录</h2><table id="handovers"><thead><tr><th>ID</th><th>区域</th><th>原船</th><th>接替船</th><th>状态</th><th>预留时刻</th><th>切换时刻</th><th>要求到场</th><th>预计航程(分)</th><th>失败原因</th></tr></thead><tbody></tbody></table>
 <h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<script>
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  const esc=s=>s==null?'':String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${esc(r[c])}</td>`).join('')+'</tr>').join('')};
+  fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);
+  fill('assets',d.assets,['name','kind','status','range_km']);
+  const relayTag=s=>s==null?'':`<span class="tag ${esc(s)}">${esc(s==='reserved'?'已预留':s==='switched'?'已切换':s==='failed'?'已失败':s)}</span>`;
+  document.querySelector('#areas tbody').innerHTML=d.search_areas.map(r=>{
+    const reason=(r.relay_status==='failed'&&r.failure_reason)?`<br><small>${esc(r.failure_reason)}</small>`:'';
+    return `<tr><td>${esc(r.code)}</td><td>${esc(r.incident_id)}</td><td>${esc(r.status)}</td><td>${esc(r.priority)}</td>`+
+      `<td>${esc(r.outgoing_asset_name??'')}</td><td>${esc(r.incoming_asset_name??'')}</td>`+
+      `<td>${esc(r.switched_at??'')}</td><td>${esc(r.current_asset_name??'')}</td>`+
+      `<td>${relayTag(r.relay_status)}${reason}</td></tr>`;
+  }).join('');
+  document.querySelector('#handovers tbody').innerHTML=(d.area_handovers||[]).map(h=>`<tr>`+
+    `<td>${esc(h.id)}</td><td>${esc(h.area_id)}</td><td>${esc(h.outgoing_asset_id)}</td><td>${esc(h.incoming_asset_id)}</td>`+
+    `<td>${relayTag(h.status)}</td><td>${esc(h.reserved_at)}</td><td>${esc(h.switched_at??'')}</td>`+
+    `<td>${esc(h.arrive_before??'')}</td><td>${esc(h.eta_minutes??'')}</td><td>${esc(h.failure_reason??'')}</td></tr>`).join('');
+  document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${esc(x.created_at)} ${esc(x.action)} ${esc(x.details)}</li>`).join('');
+}
+load();
+</script></html>

@@ -6,7 +6,7 @@ import json
 import math
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -153,6 +153,26 @@ class MaritimeSARService:
                     merged_at TEXT,
                     summary TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS area_handovers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    area_id INTEGER NOT NULL REFERENCES search_areas(id),
+                    incident_id INTEGER NOT NULL REFERENCES incidents(id),
+                    outgoing_asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    incoming_asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    status TEXT NOT NULL DEFAULT 'reserved',
+                    eta_minutes REAL,
+                    arrive_before TEXT,
+                    failure_reason TEXT NOT NULL DEFAULT '',
+                    reserved_by TEXT NOT NULL,
+                    reserved_at TEXT NOT NULL,
+                    switched_at TEXT,
+                    completed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_handovers_area ON area_handovers(area_id, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_pending_handover_per_area
+                    ON area_handovers(area_id) WHERE status='reserved';
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_pending_handover_per_incoming
+                    ON area_handovers(incoming_asset_id) WHERE status='reserved';
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     incident_id INTEGER REFERENCES incidents(id),
@@ -165,6 +185,55 @@ class MaritimeSARService:
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
                 """
             )
+            self._recover_pending_handovers()
+
+    def _parse_deadline(self, value: Any, field: str) -> datetime:
+        text = str(value).strip()
+        if not text:
+            raise DomainError("%s不能为空" % field)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise DomainError("%s必须是 ISO 8601 时间" % field) from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _check_area_fit(self, conn: sqlite3.Connection, area: sqlite3.Row, incident: sqlite3.Row,
+                        asset: sqlite3.Row) -> float:
+        """按能力、海况、航程校验资源能否承担区域，返回到场距离（公里）。"""
+        if incident["sea_state"] > asset["max_sea_state"]:
+            raise DomainError("海况超出资源能力", 409)
+        capabilities = json.loads(asset["capabilities"])
+        if area["kind"] not in capabilities:
+            raise DomainError("资源不具备该搜索区域能力", 409)
+        distance = haversine_km(asset["latitude"], asset["longitude"], area["center_lat"], area["center_lon"])
+        if distance > asset["range_km"]:
+            raise DomainError("搜索区域超出资源航程", 409)
+        return distance
+
+    def _recover_pending_handovers(self) -> None:
+        """服务重启后把未确认的预留退回原船，并保留失败原因。"""
+        now = utcnow()
+        with self.connect() as conn:
+            pending = conn.execute("SELECT * FROM area_handovers WHERE status='reserved'").fetchall()
+            for handover in pending:
+                conn.execute(
+                    "UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=? AND status='reserved'",
+                    (now, handover["incoming_asset_id"]),
+                )
+                reason = "服务重启，未确认的接替预留已退回原船"
+                conn.execute(
+                    "UPDATE area_handovers SET status='failed',failure_reason=?,completed_at=? WHERE id=?",
+                    (reason, now, handover["id"]),
+                )
+                self._audit(conn, handover["incident_id"], "system", "relay.recovered", {
+                    "handover_id": handover["id"], "area_id": handover["area_id"],
+                    "outgoing_asset_id": handover["outgoing_asset_id"],
+                    "incoming_asset_id": handover["incoming_asset_id"], "reason": reason,
+                })
 
     def _audit(self, conn: sqlite3.Connection, incident_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -308,14 +377,7 @@ class MaritimeSARService:
                 raise DomainError("资源状态已变化，请刷新后重试", 409)
             if asset["status"] != "available":
                 raise DomainError("资源当前不可用", 409)
-            if incident["sea_state"] > asset["max_sea_state"]:
-                raise DomainError("海况超出资源能力", 409)
-            capabilities = json.loads(asset["capabilities"])
-            if area["kind"] not in capabilities:
-                raise DomainError("资源不具备该搜索区域能力", 409)
-            distance = haversine_km(asset["latitude"], asset["longitude"], area["center_lat"], area["center_lon"])
-            if distance > asset["range_km"]:
-                raise DomainError("搜索区域超出资源航程", 409)
+            distance = self._check_area_fit(conn, area, incident, asset)
             now = utcnow()
             changed = conn.execute(
                 "UPDATE assets SET status='assigned',version=version+1,updated_at=? WHERE id=? AND status='available' AND version=?",
@@ -329,6 +391,161 @@ class MaritimeSARService:
             )
             self._audit(conn, area["incident_id"], actor, "area.assigned", {"area_id": area_id, "asset_id": asset_id, "distance_km": round(distance, 2)})
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
+
+    def reserve_relay(self, actor: str, role: str, area_id: int, incoming_asset_id: int,
+                      arrive_before: str, max_transit_minutes: float | None = None,
+                      expected_incoming_version: int | None = None) -> dict[str, Any]:
+        """校验并预留在途接替船；确认前原船继续担责。"""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "预留学生接替船")
+        deadline = self._parse_deadline(arrive_before, "到场时限")
+        if deadline <= datetime.now(timezone.utc):
+            raise DomainError("到场时限必须晚于当前时间")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
+            if not area:
+                raise DomainError("搜索区域不存在", 404)
+            if area["assigned_asset_id"] is None:
+                raise DomainError("搜索区域尚未分配，不能安排接替", 409)
+            incident = conn.execute("SELECT * FROM incidents WHERE id=?", (area["incident_id"],)).fetchone()
+            if not incident or incident["status"] not in ACTIVE_INCIDENT:
+                raise DomainError("事件当前不可安排接替", 409)
+            if conn.execute("SELECT 1 FROM area_handovers WHERE area_id=? AND status='reserved'", (area_id,)).fetchone():
+                raise DomainError("该区域已有待确认的接替预留，请先确认或取消", 409)
+            incoming = conn.execute("SELECT * FROM assets WHERE id=?", (incoming_asset_id,)).fetchone()
+            if not incoming:
+                raise DomainError("接替资源不存在", 404)
+            if incoming["id"] == area["assigned_asset_id"]:
+                raise DomainError("接替船不能与原船相同", 409)
+            if expected_incoming_version is not None and incoming["version"] != int(expected_incoming_version):
+                raise DomainError("接替资源状态已变化，请刷新后重试", 409)
+            if incoming["status"] != "available":
+                raise DomainError("接替资源当前不可用", 409)
+            distance = self._check_area_fit(conn, area, incident, incoming)
+            eta_minutes = distance / max(incoming["speed_kn"], 1e-9) * 60 / 1.852
+            now_dt = datetime.now(timezone.utc)
+            eta_dt = now_dt + timedelta(minutes=eta_minutes)
+            if eta_dt > deadline:
+                raise DomainError(
+                    "接替船预计 %s 到场，晚于要求的 %s，无法按时接替"
+                    % (eta_dt.isoformat(timespec="seconds"), deadline.isoformat(timespec="seconds")), 409,
+                )
+            if max_transit_minutes is not None:
+                try:
+                    max_transit = float(max_transit_minutes)
+                except (TypeError, ValueError) as exc:
+                    raise DomainError("最大在途时间必须是数值") from exc
+                if max_transit > 0 and eta_minutes > max_transit:
+                    raise DomainError("接替船在途时间 %.0f 分钟，超过允许的 %.0f 分钟" % (eta_minutes, max_transit), 409)
+            changed = conn.execute(
+                "UPDATE assets SET status='reserved',version=version+1,updated_at=? WHERE id=? AND status='available'",
+                (utcnow(), incoming_asset_id),
+            )
+            if changed.rowcount != 1:
+                raise DomainError("接替资源已被其他协调员占用", 409)
+            now = utcnow()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO area_handovers(area_id,incident_id,outgoing_asset_id,incoming_asset_id,
+                       status,eta_minutes,arrive_before,reserved_by,reserved_at)
+                       VALUES(?,?,?,?, 'reserved',?,?,?,?)""",
+                    (area_id, area["incident_id"], area["assigned_asset_id"], incoming_asset_id,
+                     round(eta_minutes, 2), deadline.isoformat(timespec="seconds"), actor, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该区域或接替船已存在待确认预留", 409) from exc
+            handover_id = int(cur.lastrowid)
+            self._audit(conn, area["incident_id"], actor, "relay.reserved", {
+                "handover_id": handover_id, "area_id": area_id,
+                "outgoing_asset_id": area["assigned_asset_id"], "incoming_asset_id": incoming_asset_id,
+                "distance_km": round(distance, 2), "eta_minutes": round(eta_minutes, 2),
+            })
+            return self._handover_view(conn, dict(conn.execute("SELECT * FROM area_handovers WHERE id=?", (handover_id,)).fetchone()))
+
+    def confirm_relay(self, actor: str, role: str, handover_id: int,
+                      expected_incoming_version: int | None = None) -> dict[str, Any]:
+        """确认接替：责任切换到接替船，原船释放。"""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "确认接替交接")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            handover = conn.execute("SELECT * FROM area_handovers WHERE id=?", (handover_id,)).fetchone()
+            if not handover:
+                raise DomainError("接替记录不存在", 404)
+            if handover["status"] != "reserved":
+                raise DomainError("接替预留已结束，不能确认：%s" % handover["status"], 409)
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (handover["area_id"],)).fetchone()
+            if not area or area["assigned_asset_id"] != handover["outgoing_asset_id"]:
+                raise DomainError("区域责任已变化，接替预留失效", 409)
+            incoming = conn.execute("SELECT * FROM assets WHERE id=?", (handover["incoming_asset_id"],)).fetchone()
+            if not incoming or incoming["status"] != "reserved":
+                raise DomainError("接替船预留状态已丢失", 409)
+            if expected_incoming_version is not None and incoming["version"] != int(expected_incoming_version):
+                raise DomainError("接替资源状态已变化，请刷新后重试", 409)
+            now = utcnow()
+            conn.execute(
+                "UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?",
+                (now, handover["outgoing_asset_id"]),
+            )
+            conn.execute(
+                "UPDATE assets SET status='assigned',version=version+1,updated_at=? WHERE id=?",
+                (now, handover["incoming_asset_id"]),
+            )
+            conn.execute(
+                "UPDATE search_areas SET assigned_asset_id=?,version=version+1,updated_at=? WHERE id=?",
+                (handover["incoming_asset_id"], now, handover["area_id"]),
+            )
+            conn.execute(
+                "UPDATE area_handovers SET status='switched',switched_at=?,completed_at=? WHERE id=?",
+                (now, now, handover_id),
+            )
+            self._audit(conn, handover["incident_id"], actor, "relay.switched", {
+                "handover_id": handover_id, "area_id": handover["area_id"],
+                "outgoing_asset_id": handover["outgoing_asset_id"],
+                "incoming_asset_id": handover["incoming_asset_id"], "switched_at": now,
+            })
+            return self._handover_view(conn, dict(conn.execute("SELECT * FROM area_handovers WHERE id=?", (handover_id,)).fetchone()))
+
+    def fail_relay(self, actor: str, role: str, handover_id: int, reason: str) -> dict[str, Any]:
+        """接替失败：预留退回原船（原船继续担责），保留失败原因。"""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "标记接替失败")
+        reason = reason.strip()
+        if not reason:
+            raise DomainError("失败原因不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            handover = conn.execute("SELECT * FROM area_handovers WHERE id=?", (handover_id,)).fetchone()
+            if not handover:
+                raise DomainError("接替记录不存在", 404)
+            if handover["status"] != "reserved":
+                raise DomainError("接替预留已结束，不能标记失败：%s" % handover["status"], 409)
+            now = utcnow()
+            conn.execute(
+                "UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=? AND status='reserved'",
+                (now, handover["incoming_asset_id"]),
+            )
+            conn.execute(
+                "UPDATE area_handovers SET status='failed',failure_reason=?,completed_at=? WHERE id=?",
+                (reason, now, handover_id),
+            )
+            self._audit(conn, handover["incident_id"], actor, "relay.failed", {
+                "handover_id": handover_id, "area_id": handover["area_id"],
+                "outgoing_asset_id": handover["outgoing_asset_id"],
+                "incoming_asset_id": handover["incoming_asset_id"], "reason": reason,
+            })
+            return self._handover_view(conn, dict(conn.execute("SELECT * FROM area_handovers WHERE id=?", (handover_id,)).fetchone()))
+
+    def _handover_view(self, conn: sqlite3.Connection, handover: dict[str, Any]) -> dict[str, Any]:
+        """组装单条交接记录，附原船/接替船名称与当前责任人。"""
+        outgoing = conn.execute("SELECT name FROM assets WHERE id=?", (handover["outgoing_asset_id"],)).fetchone()
+        incoming = conn.execute("SELECT name FROM assets WHERE id=?", (handover["incoming_asset_id"],)).fetchone()
+        area = conn.execute("SELECT assigned_asset_id,status FROM search_areas WHERE id=?", (handover["area_id"],)).fetchone()
+        handover["outgoing_asset_name"] = outgoing["name"] if outgoing else None
+        handover["incoming_asset_name"] = incoming["name"] if incoming else None
+        handover["current_asset_id"] = area["assigned_asset_id"] if area and area["status"] not in {"completed", "abandoned"} else None
+        return handover
 
     def record_clue(self, actor: str, role: str, incident_id: int, client_event_id: str,
                     latitude: float, longitude: float, confidence: float, source: str,
@@ -402,6 +619,14 @@ class MaritimeSARService:
                 raise DomainError("资源状态已变化，请刷新后重试", 409)
             if asset["status"] == "available":
                 raise DomainError("资源当前未分配", 409)
+            if asset["status"] == "reserved":
+                raise DomainError("资源已被预留为接替船，请先由协调员确认或取消接替", 409)
+            pending_out = conn.execute(
+                "SELECT id FROM area_handovers WHERE outgoing_asset_id=? AND status='reserved'",
+                (asset_id,),
+            ).fetchone()
+            if pending_out:
+                raise DomainError("该船担责的区域有待确认接替，交接完成前不能撤回，避免出现空档", 409)
             now = utcnow()
             areas = conn.execute("SELECT id,incident_id FROM search_areas WHERE assigned_asset_id=? AND status IN ('assigned','active')", (asset_id,)).fetchall()
             for area in areas:
@@ -449,9 +674,27 @@ class MaritimeSARService:
                 raise DomainError("搜索区域已经结束", 409)
             if expected_version is not None and area["version"] != int(expected_version):
                 raise DomainError("搜索区域已变化，请刷新后重试", 409)
+            now = utcnow()
+            pending = conn.execute(
+                "SELECT * FROM area_handovers WHERE area_id=? AND status='reserved'", (area_id,)
+            ).fetchall()
+            for handover in pending:
+                conn.execute(
+                    "UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=? AND status='reserved'",
+                    (now, handover["incoming_asset_id"]),
+                )
+                reason = "区域以 %s 结束，接替预留自动取消" % outcome
+                conn.execute(
+                    "UPDATE area_handovers SET status='failed',failure_reason=?,completed_at=? WHERE id=?",
+                    (reason, now, handover["id"]),
+                )
+                self._audit(conn, area["incident_id"], actor, "relay.cancelled", {
+                    "handover_id": handover["id"], "area_id": area_id,
+                    "incoming_asset_id": handover["incoming_asset_id"], "reason": reason,
+                })
             if area["assigned_asset_id"] is not None:
-                conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (utcnow(), area["assigned_asset_id"]))
-            conn.execute("UPDATE search_areas SET status=?,assigned_asset_id=NULL,version=version+1,updated_at=? WHERE id=?", (outcome, utcnow(), area_id))
+                conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (now, area["assigned_asset_id"]))
+            conn.execute("UPDATE search_areas SET status=?,assigned_asset_id=NULL,version=version+1,updated_at=? WHERE id=?", (outcome, now, area_id))
             self._audit(conn, area["incident_id"], actor, "area." + outcome, {"area_id": area_id})
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
 
@@ -554,8 +797,33 @@ class MaritimeSARService:
             areas = [dict(r) for r in conn.execute("SELECT * FROM search_areas ORDER BY priority,id").fetchall()]
             clues = [dict(r) for r in conn.execute("SELECT * FROM clues ORDER BY id DESC LIMIT 200").fetchall()]
             assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
+            handovers = [dict(r) for r in conn.execute("SELECT * FROM area_handovers ORDER BY id DESC").fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
-        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues, "timeline": timeline}
+        asset_names = {item["id"]: item["name"] for item in assets}
+        latest_by_area: dict[int, dict[str, Any]] = {}
+        for handover in handovers:
+            latest_by_area.setdefault(handover["area_id"], handover)
+        for area in areas:
+            handover = latest_by_area.get(area["id"])
+            ended = area["status"] in {"completed", "abandoned"}
+            area["current_asset_id"] = None if ended else area["assigned_asset_id"]
+            area["current_asset_name"] = asset_names.get(area["current_asset_id"])
+            if handover:
+                area["relay_status"] = handover["status"]
+                area["outgoing_asset_id"] = handover["outgoing_asset_id"]
+                area["outgoing_asset_name"] = asset_names.get(handover["outgoing_asset_id"])
+                area["incoming_asset_id"] = handover["incoming_asset_id"]
+                area["incoming_asset_name"] = asset_names.get(handover["incoming_asset_id"])
+                area["switched_at"] = handover["switched_at"]
+                area["reserved_at"] = handover["reserved_at"]
+                area["failure_reason"] = handover["failure_reason"]
+                area["arrive_before"] = handover["arrive_before"]
+                area["eta_minutes"] = handover["eta_minutes"]
+                area["handover_id"] = handover["id"]
+            else:
+                area["relay_status"] = None
+        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues,
+                "area_handovers": handovers, "timeline": timeline}
 
     def incident_timeline(self, incident_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -641,6 +909,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.create_search_area(actor, role, **data)
             elif path == "/api/assignments":
                 result = self.service.assign_area(actor, role, **data)
+            elif path == "/api/relays/reserve":
+                result = self.service.reserve_relay(actor, role, **data)
+            elif path == "/api/relays/confirm":
+                result = self.service.confirm_relay(actor, role, **data)
+            elif path == "/api/relays/fail":
+                result = self.service.fail_relay(actor, role, **data)
             elif path == "/api/clues":
                 result = self.service.record_clue(actor, role, **data)
             elif path == "/api/clues/verify":
